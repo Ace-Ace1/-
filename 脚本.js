@@ -2178,7 +2178,7 @@
       // 构建调试框完整HTML（添加宽度限制和横向滚动）
       const debugBoxHtml = `
                 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;border-bottom:1px solid #444;padding-bottom:5px;flex-wrap:wrap;">
-                    <span style="font-weight:bold;color:#4CAF50;">近30天商品访客数+加购件数+支付金额+实收款自动获取脚本</span>
+                    <span style="font-weight:bold;color:#4CAF50;">近30天商品访客数/加购件数/支付金额+近3个月订单自动获取 --zzy</span>
                     <span style="font-size:11px;color:#999;">${new Date().toLocaleTimeString()}</span>
                 </div>
                 ${cookiePanel}
