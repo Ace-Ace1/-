@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         近30天商品访客数/加购件数/支付金额+近3个月订单信息    --zzy
+// @name         近30天商品访客数/加购件数/支付金额+近3个月订单自动获取    --Ace
 // @namespace    http://tampermonkey.net/
 // @version      23.6
-// @description  悬浮球唤出调试框，可配置并发数量/间隔，风控识别，任意一项有数据显示绿色，字体缩小；新增actualFee字段获取
+// @description  悬浮球唤出调试框，可配置并发数量/间隔，风控识别
 // @author       zzy（优化版）
 // @match        https://myseller.taobao.com/home.htm/SellManage/*
 // @match        https://myseller.taobao.com/home.htm*
@@ -22,7 +22,7 @@
   // 最大并发请求数（默认1，范围1-20）
   let globalMaxConcurrent = 1;
   // 请求间隔（毫秒，默认500，最小100）
-  let globalRequestInterval = 500;
+  let globalRequestInterval = 1000;
   // cookie2值（需要手动填写）
   let globalCookie2 = "";
 
@@ -39,10 +39,12 @@
   let requestedProductIds = [];
   // 批量请求是否正在运行
   let batchRequestRunning = true; // 初始为true，避免初始化触发
-  // 折叠状态（默认收起：ids=true、results=true）
+  // 折叠状态（默认收起：ids=true、results=true、resultsSuccess/resultsFailed 分开）
   let foldState = {
-    ids: true, // ID列表默认收起
-    results: true, // 请求结果默认收起
+    ids: true,
+    results: true,
+    resultsSuccess: true,  // 📡 请求成功结果
+    resultsFailed: true,   // 📡 请求失败结果
   };
   // 并发请求状态统计
   let concurrentStatus = {
@@ -53,10 +55,23 @@
   };
   // cookie输入框是否聚焦
   let cookieInputFocused = false;
-  // 是否触发风控限制
+  // 重新请求按钮冷却结束时间戳（0 表示未在冷却）
+  let retryButtonCooldownUntil = 0;
+  let retryButtonCooldownTimer = null;
+  // 是否触发风控限制（展示用：任一接口被限制即 true）
   let isRateLimited = false;
+  // 分接口风控：Sycm（商品访客/加购/支付）与 Trade（actualFee）独立，一个被限制不影响另一个继续请求
+  let isRateLimitedSycm = false;
+  let isRateLimitedTrade = false;
 
   // ===================== 工具函数 =====================
+  /**
+   * 更新全局风控展示状态（根据 Sycm/Trade 两个标志计算）
+   */
+  function updateRateLimitDisplay() {
+    isRateLimited = isRateLimitedSycm || isRateLimitedTrade;
+  }
+
   /**
    * 延迟函数（控制请求间隔）
    * @param {number} ms 延迟毫秒数
@@ -69,10 +84,20 @@
   /**
    * 检测响应数据是否是风控限制返回
    * @param {string} responseText 接口响应文本
+   * @param {string} [source] 来源：'sycm' 为商品指标接口，'trade' 为 actualFee 接口；只标记对应接口，另一接口继续正常请求
    * @returns {boolean} 是否是风控数据
    */
-  function isRateLimitData(responseText) {
+  function isRateLimitData(responseText, source) {
     try {
+      // 首先检测特定的错误信息 "SM::哎哟喂,被挤爆啦,请稍后重试"
+      if (responseText.includes("SM::哎哟喂,被挤爆啦,请稍后重试") || responseText.includes("被挤爆啦")) {
+        if (source === "trade") isRateLimitedTrade = true;
+        else isRateLimitedSycm = true;
+        updateRateLimitDisplay();
+        return true;
+      }
+
+      // 然后检测传统的风控格式
       const responseData = JSON.parse(responseText);
       // 风控特征：包含rgv587_flag=sm 且 url包含bixi.alicdn.com/punish
       if (
@@ -80,12 +105,21 @@
         responseData.url &&
         responseData.url.includes("bixi.alicdn.com/punish")
       ) {
-        isRateLimited = true; // 标记为风控状态
+        if (source === "trade") isRateLimitedTrade = true;
+        else isRateLimitedSycm = true;
+        updateRateLimitDisplay();
         return true;
       }
       return false;
     } catch (error) {
-      return false; // 非JSON格式，不是风控数据
+      // 即使JSON解析失败，也检查字符串中是否包含特定错误信息
+      if (responseText.includes("SM::哎哟喂,被挤爆啦,请稍后重试") || responseText.includes("被挤爆啦")) {
+        if (source === "trade") isRateLimitedTrade = true;
+        else isRateLimitedSycm = true;
+        updateRateLimitDisplay();
+        return true;
+      }
+      return false; // 非JSON格式且不包含特定错误信息
     }
   }
 
@@ -121,6 +155,51 @@
    */
   function getTimestamp() {
     return Date.now();
+  }
+
+  /** 判断是否为需要重试的失败（风控/错误等，非“暂无数据”） */
+  function isRetryableFailure(msg) {
+    if (typeof msg !== "string") return false;
+    return (
+      msg.includes("RGV587_ERROR") ||
+      msg.includes("被挤爆啦") ||
+      msg.includes("请求被限制") ||
+      msg.includes("请求太频繁被限制") ||
+      msg.includes("cookie2未填写") ||
+      msg.includes("产品ID为空")
+    );
+  }
+
+  /**
+   * 获取主请求（Sycm 商品指标）失败、需要整单重试的商品ID
+   * @returns {array}
+   */
+  function getFailedMainRequestIds() {
+    return requestResults
+      .filter(
+        (item) =>
+          item &&
+          item.payAmt &&
+          item.payAmt.success === false &&
+          isRetryableFailure(item.payAmt.msg)
+      )
+      .map((item) => item.productId);
+  }
+
+  /**
+   * 获取 actualFee 失败的商品ID
+   * @returns {array} 未成功请求 actualFee 的商品ID列表
+   */
+  function getFailedActualFeeIds() {
+    return requestResults
+      .filter(
+        (item) =>
+          item &&
+          item.actualFee &&
+          item.actualFee.success === false &&
+          isRetryableFailure(item.actualFee.msg)
+      )
+      .map((item) => item.productId);
   }
 
   /**
@@ -283,8 +362,8 @@
    * @returns {object} 提取结果
    */
   function extractMetrics(responseText) {
-    // 先检测是否是风控数据
-    if (isRateLimitData(responseText)) {
+    // 先检测是否是风控数据（商品指标接口）
+    if (isRateLimitData(responseText, "sycm")) {
       return {
         payAmt: {
           success: false,
@@ -395,18 +474,29 @@
   }
 
   /**
+   * 响应/msg 包含「被挤爆啦」或「请求太频繁被限制」时视为请求失败（被限制），显示「请求失败」；其他失败显示暂无数据
+   * @param {string} msg 接口返回的 msg
+   * @returns {boolean}
+   */
+  function isRateLimitFailure(msg) {
+    if (typeof msg !== "string") return false;
+    return msg.includes("被挤爆啦") || msg.includes("请求太频繁被限制");
+  }
+
+  /**
    * 获取指定商品ID的支付金额
    * @param {string} productId 商品ID
    * @returns {string} 支付金额（格式化后）
    */
   function getPayAmt(productId) {
-    if (isRateLimited) return "请求太频繁被限制";
-
     const result = requestResults.find((item) => item.productId === productId);
     if (result && result.payAmt && result.payAmt.success) {
       return formatNumber(result.payAmt.value);
     }
-    return result && result.payAmt ? "暂无数据" : "待请求";
+    if (result && result.payAmt) {
+      return isRateLimitFailure(result.payAmt.msg) ? "请求失败" : "暂无数据";
+    }
+    return "待请求";
   }
 
   /**
@@ -415,14 +505,14 @@
    * @returns {string} 加购件数
    */
   function getCartCount(productId) {
-    if (isRateLimited) return "请求太频繁被限制";
-
     const result = requestResults.find((item) => item.productId === productId);
-    return result && result.itemCartCnt && result.itemCartCnt.success
-      ? result.itemCartCnt.value
-      : result && result.itemCartCnt
-        ? "暂无数据"
-        : "待请求";
+    if (result && result.itemCartCnt && result.itemCartCnt.success) {
+      return result.itemCartCnt.value;
+    }
+    if (result && result.itemCartCnt) {
+      return isRateLimitFailure(result.itemCartCnt.msg) ? "请求失败" : "暂无数据";
+    }
+    return "待请求";
   }
 
   /**
@@ -431,14 +521,14 @@
    * @returns {string} 访客数
    */
   function getVisitorCount(productId) {
-    if (isRateLimited) return "请求太频繁被限制";
-
     const result = requestResults.find((item) => item.productId === productId);
-    return result && result.itmUv && result.itmUv.success
-      ? result.itmUv.value
-      : result && result.itmUv
-        ? "暂无数据"
-        : "待请求";
+    if (result && result.itmUv && result.itmUv.success) {
+      return result.itmUv.value;
+    }
+    if (result && result.itmUv) {
+      return isRateLimitFailure(result.itmUv.msg) ? "请求失败" : "暂无数据";
+    }
+    return "待请求";
   }
 
   /**
@@ -447,8 +537,6 @@
    * @returns {string} 实收款
    */
   function getActualFee(productId) {
-    if (isRateLimited) return "请求太频繁被限制";
-
     const result = requestResults.find((item) => item.productId === productId);
     
     // 调试：打印getActualFee函数的查找结果
@@ -473,7 +561,7 @@
           return `${orderCount}个订单 (小于10元: ${lowAmountOrderCount}个)`;
         }
       }
-      return "暂无数据";
+      return isRateLimitFailure(result.actualFee.msg) ? "请求失败" : "暂无数据";
     }
     return "待请求";
   }
@@ -484,12 +572,12 @@
    * @returns {Promise} 请求结果Promise
    */
   function singleActualFeeRequest(productId) {
-    // 风控状态下直接返回失败
+    // 风控状态下直接返回失败（未发起请求，无响应内容，显示暂无数据）
     if (isRateLimited) {
       return Promise.resolve({
         success: false,
         value: "",
-        msg: "请求太频繁被限制，关闭脚本过三四分钟再打开",
+        msg: "请求太频繁被限制",
         responseText:
           '{"rgv587_flag":"sm","url":"https://bixi.alicdn.com/punish/..."}',
       });
@@ -607,16 +695,17 @@
           timeout: 10000, // 10秒超时
           onload: (response) => {
             try {
-              // 检测风控数据
-              if (isRateLimitData(response.responseText)) {
+              // 检测风控数据（actualFee 接口，仅标记 trade，不影响主接口继续请求）
+              if (isRateLimitData(response.responseText, "trade")) {
                 showTip(
-                  "⚠️ 请求太频繁被限制！关闭脚本过三四分钟再打开",
+                  "⚠️ actualFee 请求被限制，其他数据继续请求",
                   "error",
                 );
+                const burstMsg = response.responseText.includes("被挤爆啦") ? "被挤爆啦" : "请求太频繁被限制";
                 resolve({
                   success: false,
                   value: "",
-                  msg: "请求太频繁被限制，关闭脚本过三四分钟再打开",
+                  msg: burstMsg,
                   responseText: response.responseText,
                 });
                 return;
@@ -662,11 +751,11 @@
                       actualFeeValue = responseData.response.actualFee;
                     }
                     // 路径6：在responseData.data.result中
-                    else if (responseData.data && responseData.data.result && responseData.data.result.actualFee) {
+                    else if (responseData.data?.result?.actualFee) {
                       actualFeeValue = responseData.data.result.actualFee;
                     }
                     // 路径7：在responseData.data.content中
-                    else if (responseData.data && responseData.data.content && responseData.data.content.actualFee) {
+                    else if (responseData.data?.content?.actualFee) {
                       actualFeeValue = responseData.data.content.actualFee;
                     }
                   }
@@ -720,7 +809,7 @@
                       }
                     }
                     // 路径5：在responseData.data.content中
-                    else if (responseData.data && responseData.data.content) {
+                    else if (responseData.data?.content) {
                       if (Array.isArray(responseData.data.content.mainOrders)) {
                         mainOrders = responseData.data.content.mainOrders;
                       } else if (responseData.data.content.mainOrders && typeof responseData.data.content.mainOrders === 'object') {
@@ -736,7 +825,7 @@
                       }
                     }
                     // 路径7：在responseData.data.result中
-                    else if (responseData.data && responseData.data.result) {
+                    else if (responseData.data?.result) {
                       if (Array.isArray(responseData.data.result.mainOrders)) {
                         mainOrders = responseData.data.result.mainOrders;
                       } else if (responseData.data.result.mainOrders && typeof responseData.data.result.mainOrders === 'object') {
@@ -1045,17 +1134,7 @@
           element.parentNode.insertBefore(metricsNode, element.nextSibling);
         }
 
-        // 风控状态：显示红色提示
-        if (isRateLimited) {
-          metricsNode.style.background = "#FF5722";
-          metricsNode.style.color = "#FFFFFF";
-          metricsNode.style.fontWeight = "bold";
-          metricsNode.textContent = 
-            "请求太频繁被限制，关闭脚本过三四分钟再打开";
-          return;
-        }
-
-        // 获取指标数据
+        // 始终用 requestResults 中的实际数据显示，风控时也不替换为整页提示（保留之前请求成功的数据）
         const payAmt = getPayAmt(productId);
         const visitorCount = getVisitorCount(productId);
         const cartCount = getCartCount(productId);
@@ -1063,20 +1142,27 @@
 
         // 判断是否有有效数据（任意一项有数据则显示绿色）
         const hasValidData = 
-          (payAmt !== "待请求" && payAmt !== "暂无数据") ||
-          (visitorCount !== "待请求" && visitorCount !== "暂无数据") ||
-          (cartCount !== "待请求" && cartCount !== "暂无数据");
+          (payAmt !== "待请求" && payAmt !== "暂无数据" && payAmt !== "请求失败") ||
+          (visitorCount !== "待请求" && visitorCount !== "暂无数据" && visitorCount !== "请求失败") ||
+          (cartCount !== "待请求" && cartCount !== "暂无数据" && cartCount !== "请求失败");
 
-        // 设置样式
+        // 设置样式：有有效数据=绿色，三项全是暂无数据=黄色，其余（含请求失败/待请求）=红色
         let bgColor = "#f5f5f5";
         let textColor = "#999";
         if (hasValidData) {
           bgColor = "#e8f5e9";
           textColor = "#2e7d32";
         } else if (
-          payAmt === "暂无数据" ||
-          visitorCount === "暂无数据" ||
+          payAmt === "暂无数据" &&
+          visitorCount === "暂无数据" &&
           cartCount === "暂无数据"
+        ) {
+          bgColor = "#fff8e1";
+          textColor = "#f57f17";
+        } else if (
+          payAmt === "暂无数据" || payAmt === "请求失败" ||
+          visitorCount === "暂无数据" || visitorCount === "请求失败" ||
+          cartCount === "暂无数据" || cartCount === "请求失败"
         ) {
           bgColor = "#ffebee";
           textColor = "#FF5722";
@@ -1088,67 +1174,59 @@
         metricsNode.textContent = `【近30天】支付金额:${payAmt} | 访客数:${visitorCount} | 加购件数:${cartCount}`;
       });
       
+      // 从销量行元素解析出商品ID（与点击逻辑一致）
+      const getProductIdFromSoldRow = (el) => {
+        let productId = null;
+        const currentRow = el.closest(".l-config-list-row");
+        if (currentRow) {
+          const productDescSpan = currentRow.querySelector(".product-desc-span");
+          if (productDescSpan) {
+            const text = productDescSpan.textContent?.trim() || "";
+            const idMatch = text.match(/ID[:：]\s*(.+)/);
+            if (idMatch && idMatch[1]) productId = idMatch[1].trim();
+          }
+        }
+        if (!productId && el.parentElement) {
+          let currentElement = el;
+          for (let i = 0; i < 5; i++) {
+            if (!currentElement) break;
+            currentElement = currentElement.parentElement;
+            if (currentElement) {
+              const text = currentElement.textContent?.trim() || "";
+              const idMatch = text.match(/ID[:：]\s*(\d+)/);
+              if (idMatch && idMatch[1]) { productId = idMatch[1].trim(); break; }
+              if (currentElement.dataset && currentElement.dataset.productId) { productId = currentElement.dataset.productId; break; }
+              if (currentElement.id && /\d+/.test(currentElement.id)) { productId = currentElement.id.match(/\d+/)[0]; break; }
+            }
+          }
+        }
+        return productId;
+      };
+
       // 在销量显示元素右侧添加查看详情按钮
       const soldQuantityElements = document.querySelectorAll(".l-form-text.l-config-list-cell-text-soldQuantity_m");
       soldQuantityElements.forEach((element) => {
         // 检查是否已添加过按钮，避免重复添加
         if (!element.dataset.detailButtonAdded) {
           const detailButton = document.createElement("button");
-          detailButton.textContent = "查看详情";
+          detailButton.textContent = "等待请求";
           detailButton.style.cssText = `
             margin-left: 8px;
             padding: 2px 8px;
-            background-color: #2196F3;
+            background-color: #9e9e9e;
             color: white;
             border: none;
             border-radius: 4px;
             cursor: pointer;
             font-size: 12px;
           `;
-          
+          const hintDiv = document.createElement("div");
+          hintDiv.style.cssText = "font-size: 11px; color: #FF5722; margin-top: 4px; margin-left: 8px; display: none;";
+          hintDiv.innerHTML = '请点此<a href="https://myseller.taobao.com/home.htm/trade-platform/tp/sold" target="_blank" rel="noopener noreferrer" style="color:#2196F3;text-decoration:underline;">交易-已卖出宝贝</a>跳转页面过滑块验证';
+
           // 添加点击事件
           detailButton.addEventListener("click", () => {
-            // 从当前销量元素层级中获取对应的商品ID
-            let productId = null;
-            
-            // 方法1：尝试在同一行找到product-desc-span元素
-            let currentRow = element.closest(".l-config-list-row");
-            if (currentRow) {
-              const productDescSpan = currentRow.querySelector(".product-desc-span");
-              if (productDescSpan) {
-                const text = productDescSpan.textContent?.trim() || "";
-                const idMatch = text.match(/ID[:：]\s*(.+)/);
-                if (idMatch && idMatch[1]) {
-                  productId = idMatch[1].trim();
-                }
-              }
-            }
-            
-            // 方法2：如果方法1失败，尝试向上查找包含ID的元素
-            if (!productId) {
-              let currentElement = element;
-              for (let i = 0; i < 5; i++) { // 最多向上查找5层
-                if (!currentElement) break;
-                currentElement = currentElement.parentElement;
-                if (currentElement) {
-                  const text = currentElement.textContent?.trim() || "";
-                  const idMatch = text.match(/ID[:：]\s*(\d+)/);
-                  if (idMatch && idMatch[1]) {
-                    productId = idMatch[1].trim();
-                    break;
-                  }
-                  // 尝试直接从属性中获取ID
-                  if (currentElement.dataset && currentElement.dataset.productId) {
-                    productId = currentElement.dataset.productId;
-                    break;
-                  }
-                  if (currentElement.id && /\d+/.test(currentElement.id)) {
-                    productId = currentElement.id.match(/\d+/)[0];
-                    break;
-                  }
-                }
-              }
-            }
+            const productId = getProductIdFromSoldRow(element);
             
             // 直接从requestResults中获取订单详情数据
             const result = requestResults.find((item) => item.productId === productId);
@@ -1206,42 +1284,34 @@
                 // 获取订单详情（支持从value或orderDetails字段获取）
                 const orderDetails = actualFeeResult.orderDetails || actualFeeResult.value || [];
                 
-                // 添加实收款汇总信息
+                // 添加总计与按交易状态分类
                 let totalActualFee = "0个订单";
-                // 统计交易成功的订单
-                let lowAmountSuccessCount = 0;
-                let highAmountSuccessCount = 0;
+                /** @type {Record<string, number>} 按订单状态统计数量 */
+                const statusCount = {};
                 
                 if (orderDetails.length === 1 && orderDetails[0].orderId === "订单总额") {
                   totalActualFee = orderDetails[0].realTotal;
                 } else if (orderDetails.length > 0) {
                   const orderCount = orderDetails.length;
                   totalActualFee = `${orderCount}个订单`;
-                  
-                  // 统计小于10元并交易成功的订单数和大于10元并交易成功的订单数
                   orderDetails.forEach(order => {
-                    const amount = parseFloat(order.realTotal);
-                    // 判断订单是否交易成功（通常为"交易成功"状态）
-                    const isSuccess = order.orderStatus && order.orderStatus.includes("交易成功");
-                    
-                    if (isSuccess && !isNaN(amount)) {
-                      if (amount < 10) {
-                        lowAmountSuccessCount++;
-                      } else {
-                        highAmountSuccessCount++;
-                      }
-                    }
+                    const status = (order.orderStatus && String(order.orderStatus).trim()) || "未知";
+                    statusCount[status] = (statusCount[status] || 0) + 1;
                   });
                 }
                 
+                const statusLines = Object.keys(statusCount).length > 0
+                  ? Object.entries(statusCount).map(([status, n]) => `${status}：${n}个`).join("　")
+                  : "";
+                
                 let html = `<h3 style="margin-top: 0; color: #333;">商品ID: ${productId} - 近3个月订单数据</h3>`;
                 html += `<div style="margin-bottom: 15px; padding: 10px; background-color: #fff3e0; border-left: 4px solid #ff9800; border-radius: 3px;">`;
-                html += `<div style="font-weight: bold; color: #f57c00;">实收款: ${totalActualFee}</div>`;
-                html += `<div style="color: #757575; margin-top: 5px;">`;
-                html += `<span>小于10元并交易成功的数量：${lowAmountSuccessCount}个</span>`;
-                html += `<span style="margin-left: 20px;">大于10元并交易成功的数量：${highAmountSuccessCount}个</span>`;
+                html += `<div style="font-weight: bold; color: #f57c00;">总计: ${totalActualFee}</div>`;
+                if (statusLines) {
+                  html += `<div style="color: #757575; margin-top: 5px;">${statusLines}</div>`;
+                }
                 html += `</div>`;
-                html += `</div>`;
+                html += `<div style="margin-bottom: 10px; font-size: 12px; color: #9e9e9e;">数据来源：交易-已卖出宝贝-近3个月订单（实际会有超过3个月的订单数据）</div>`;
                   
                   if (orderDetails.length > 0) {
                     html += `<div style="margin-top: 10px;">`;
@@ -1281,10 +1351,12 @@
                   modalContent.innerHTML = html;
               }
             } else if (actualFeeResult && !actualFeeResult.success) {
-              // 显示请求失败信息
+              // 显示请求失败；凡被限制（被挤爆或请求太频繁）均显示滑块验证提示
+              const showSliderHint = isRateLimitFailure(actualFeeResult.msg);
               modalContent.innerHTML = `
                 <h3 style="margin-top: 0; color: #333;">商品ID: ${productId} - 实收款</h3>
-                <p style="color: #FF5722;">${actualFeeResult.msg || "获取数据失败"}</p>
+                <p style="color: #FF5722;">请求失败</p>
+                ${showSliderHint ? `<p style="color: #FF9800; margin-top: 10px; font-size: 13px;">请去<a href="https://myseller.taobao.com/home.htm/trade-platform/tp/sold" target="_blank" rel="noopener noreferrer" style="color:#2196F3;text-decoration:underline;">交易-已卖出宝贝</a>页面过滑块验证</p>` : ""}
               `;
             } else if (!actualFeeResult) {
               // 数据还未请求或不存在
@@ -1321,13 +1393,42 @@
             });
           });
           
-          // 标记已添加按钮
+          element._detailButton = detailButton;
+          element._detailHint = hintDiv;
           element.dataset.detailButtonAdded = "true";
-          
-          // 将按钮添加到元素右侧
           element.parentNode.insertBefore(detailButton, element.nextSibling);
+          element.parentNode.insertBefore(hintDiv, detailButton.nextSibling);
         }
       });
+
+      // 根据 actualFee 状态更新按钮：未请求=灰色等待请求，请求失败=红色，无风控且无数据=黄色暂无数据，有数据=蓝色查看详情
+      soldQuantityElements.forEach((element) => {
+        if (!element._detailButton || !element._detailHint) return;
+        const productId = getProductIdFromSoldRow(element);
+        const actualFeeDisplay = productId ? getActualFee(productId) : "";
+        if (actualFeeDisplay === "待请求") {
+          element._detailButton.textContent = "等待请求";
+          element._detailButton.style.backgroundColor = "#9e9e9e";
+          element._detailButton.style.color = "white";
+          element._detailHint.style.display = "none";
+        } else if (actualFeeDisplay === "请求失败") {
+          element._detailButton.textContent = "请求失败";
+          element._detailButton.style.backgroundColor = "#FF5722";
+          element._detailHint.style.display = "block";
+        } else if (actualFeeDisplay === "暂无数据") {
+          element._detailButton.textContent = "暂无数据";
+          element._detailButton.style.backgroundColor = "#FFC107";
+          element._detailButton.style.color = "#333";
+          element._detailHint.style.display = "none";
+        } else {
+          element._detailButton.textContent = "查看详情";
+          element._detailButton.style.backgroundColor = "#2196F3";
+          element._detailButton.style.color = "white";
+          element._detailHint.style.display = "none";
+        }
+      });
+
+      updateFloatRetryButton();
       
     } catch (error) {
       console.warn("指标渲染失败：", error);
@@ -1365,19 +1466,258 @@
   }
 
   /**
-   * 创建悬浮球（用于打开/关闭调试框）
+   * 仅重试 actualFee（主请求已成功，只补请求 actualFee 并合并回结果）
+   * @param {array} productIds 商品ID列表
+   */
+  async function batchRequestActualFeeOnly(productIds) {
+    if (productIds.length === 0) return;
+    if (batchRequestRunning) return;
+    validateRequestParams();
+    batchRequestRunning = true;
+    showTip(`🔄 仅重试 actualFee，共 ${productIds.length} 个ID`, "success");
+    if (debugBoxVisible) renderDebugBox();
+
+    const batches = [];
+    for (let i = 0; i < productIds.length; i += globalMaxConcurrent) {
+      batches.push(productIds.slice(i, i + globalMaxConcurrent));
+    }
+
+    for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
+      if (isRateLimitedSycm && isRateLimitedTrade) break;
+      const batch = batches[batchIndex];
+      if (batchIndex > 0) await sleep(globalRequestInterval);
+
+      const batchPromises = batch.map(async (productId) => {
+        try {
+          const actualFeeResult = await singleActualFeeRequest(productId);
+          const idx = requestResults.findIndex((r) => r && r.productId === productId);
+          if (idx >= 0) {
+            const existing = requestResults[idx];
+            requestResults[idx] = {
+              ...existing,
+              success: existing.success || actualFeeResult.success,
+              actualFee: actualFeeResult,
+              debug: {
+                ...existing.debug,
+                actualFeeResponse: actualFeeResult.responseText,
+                actualFeeRaw: actualFeeResult.responseText,
+              },
+            };
+          }
+          renderMetrics();
+          if (debugBoxVisible) renderDebugBox();
+          showTip(`ID ${productId} actualFee ${actualFeeResult.success ? "成功" : "失败"}`, actualFeeResult.success ? "success" : "error");
+        } catch (e) {
+          showTip(`ID ${productId} actualFee 异常：${e.message}`, "error");
+        }
+      });
+      await Promise.all(batchPromises);
+    }
+
+    batchRequestRunning = false;
+    if (debugBoxVisible) renderDebugBox();
+    renderMetrics();
+    updateFloatRetryButton();
+  }
+
+  /**
+   * 仅重试主请求（Sycm 商品指标），不请求 actualFee；合并时保留已有 actualFee
+   * @param {array} productIds 商品ID列表
+   */
+  async function batchRequestMainOnly(productIds) {
+    if (productIds.length === 0) return;
+    if (batchRequestRunning) return;
+    validateRequestParams();
+    batchRequestRunning = true;
+    showTip(`🔄 仅重试主请求，共 ${productIds.length} 个ID`, "success");
+    if (debugBoxVisible) renderDebugBox();
+
+    const batches = [];
+    for (let i = 0; i < productIds.length; i += globalMaxConcurrent) {
+      batches.push(productIds.slice(i, i + globalMaxConcurrent));
+    }
+
+    for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
+      if (isRateLimitedSycm && isRateLimitedTrade) break;
+      const batch = batches[batchIndex];
+      if (batchIndex > 0) await sleep(globalRequestInterval);
+
+      const batchPromises = batch.map(async (productId) => {
+        try {
+          const requestResult = await singleProductRequest(productId, { skipActualFee: true });
+          const existingIndex = requestResults.findIndex((r) => r && r.productId === productId);
+          if (existingIndex >= 0) {
+            requestResults[existingIndex] = mergeRequestResult(requestResults[existingIndex], requestResult);
+          } else {
+            requestResults.push(requestResult);
+          }
+          renderMetrics();
+          if (debugBoxVisible) renderDebugBox();
+          showTip(`ID ${productId} 主请求 ${requestResult.success ? "成功" : "失败"}`, requestResult.success ? "success" : "error");
+        } catch (e) {
+          showTip(`ID ${productId} 主请求异常：${e.message}`, "error");
+        }
+      });
+      await Promise.all(batchPromises);
+    }
+
+    batchRequestRunning = false;
+    if (debugBoxVisible) renderDebugBox();
+    renderMetrics();
+    updateFloatRetryButton();
+  }
+
+  /**
+   * 进入/结束重新请求按钮 10 秒冷却（禁用按钮、显示倒计时）
+   */
+  function setRetryButtonCooldown(enterCooldown) {
+    if (retryButtonCooldownTimer) {
+      clearInterval(retryButtonCooldownTimer);
+      retryButtonCooldownTimer = null;
+    }
+    const floatBtn = document.getElementById("sycm-float-retry-btn");
+    const debugBtn = document.querySelector("#retry-request-btn");
+
+    const updateCooldownText = () => {
+      const left = Math.ceil((retryButtonCooldownUntil - Date.now()) / 1000);
+      const text = left > 0 ? `冷却中(${left}s)` : "";
+      if (floatBtn) {
+        floatBtn.textContent = text || `🔄 重新请求（${getAllFailedRetryIds().length}个失败）`;
+        floatBtn.disabled = left > 0;
+      }
+      if (debugBtn) {
+        debugBtn.textContent = text || `🔄 重新请求（${getAllFailedRetryIds().length}个失败）`;
+        debugBtn.disabled = left > 0;
+      }
+      if (left <= 0) {
+        retryButtonCooldownUntil = 0;
+        if (retryButtonCooldownTimer) {
+          clearInterval(retryButtonCooldownTimer);
+          retryButtonCooldownTimer = null;
+        }
+        if (floatBtn) floatBtn.disabled = false;
+        if (debugBtn) debugBtn.disabled = false;
+        updateFloatRetryButton();
+        if (debugBoxVisible) renderDebugBox();
+      }
+    };
+
+    if (enterCooldown) {
+      retryButtonCooldownUntil = Date.now() + 10000;
+      if (floatBtn) floatBtn.disabled = true;
+      if (debugBtn) debugBtn.disabled = true;
+      updateCooldownText();
+      retryButtonCooldownTimer = setInterval(updateCooldownText, 1000);
+    } else {
+      retryButtonCooldownUntil = 0;
+      if (floatBtn) floatBtn.disabled = false;
+      if (debugBtn) debugBtn.disabled = false;
+      updateFloatRetryButton();
+    }
+  }
+
+  /**
+   * 执行重新请求失败项：主请求失败只重试主请求，actualFee 失败只重试 actualFee；
+   * 两个都失败时先串行重试主请求，再串行重试 actualFee；按钮 10 秒冷却
+   */
+  async function doRetryFailedRequests() {
+    if (Date.now() < retryButtonCooldownUntil) return;
+
+    const failedMainIds = getFailedMainRequestIds();
+    const failedActualFeeIds = getFailedActualFeeIds();
+
+    if (failedMainIds.length === 0 && failedActualFeeIds.length === 0) return;
+
+    setRetryButtonCooldown(true);
+
+    isRateLimited = false;
+    isRateLimitedSycm = false;
+    isRateLimitedTrade = false;
+    requestedProductIds = requestedProductIds.filter((id) => !failedMainIds.includes(id));
+
+    if (failedMainIds.length > 0) {
+      await batchRequestMainOnly(failedMainIds);
+    }
+    if (failedActualFeeIds.length > 0) {
+      await batchRequestActualFeeOnly(failedActualFeeIds);
+    }
+  }
+
+  /**
+   * 获取所有需要重试的失败 ID（主请求失败 + actualFee 失败，去重）
+   */
+  function getAllFailedRetryIds() {
+    const mainIds = getFailedMainRequestIds();
+    const feeIds = getFailedActualFeeIds();
+    return [...new Set([...mainIds, ...feeIds])];
+  }
+
+  /**
+   * 更新悬浮区「重新请求」按钮的显示与文案（有失败时显示在齿轮上方）
+   */
+  function updateFloatRetryButton() {
+    const btn = document.getElementById("sycm-float-retry-btn");
+    if (!btn) return;
+    const failedIds = getAllFailedRetryIds();
+    if (failedIds.length > 0) {
+      btn.style.display = "block";
+      btn.textContent = `🔄 重新请求（${failedIds.length}个失败）`;
+    } else {
+      btn.style.display = "none";
+    }
+  }
+
+  /**
+   * 创建悬浮球（用于打开/关闭调试框），上方在有失败请求时显示「重新请求」按钮
    */
   function createFloatBall() {
-    let floatBall = document.getElementById("sycm-float-ball");
-    if (floatBall) return;
+    let wrapper = document.getElementById("sycm-float-wrapper");
+    if (wrapper) {
+      updateFloatRetryButton();
+      return;
+    }
 
-    // 创建悬浮球元素
-    floatBall = document.createElement("div");
+    wrapper = document.createElement("div");
+    wrapper.id = "sycm-float-wrapper";
+    wrapper.style.cssText = `
+      position:fixed;
+      bottom:30px;
+      right:30px;
+      z-index:99999998;
+      display:flex;
+      flex-direction:column-reverse;
+      align-items:flex-end;
+      gap:8px;
+    `;
+
+    // 重新请求按钮（在齿轮上方，有失败时显示）
+    const retryBtn = document.createElement("button");
+    retryBtn.id = "sycm-float-retry-btn";
+    retryBtn.style.cssText = `
+      display:none;
+      background:#FF9800;
+      border:none;
+      color:white;
+      padding:6px 12px;
+      border-radius:6px;
+      cursor:pointer;
+      font-size:12px;
+      box-shadow:0 2px 8px rgba(0,0,0,0.2);
+      white-space:nowrap;
+    `;
+    retryBtn.textContent = "🔄 重新请求";
+    retryBtn.addEventListener("click", () => {
+      doRetryFailedRequests();
+      updateFloatRetryButton();
+      if (debugBoxVisible) renderDebugBox();
+      renderMetrics();
+    });
+    wrapper.appendChild(retryBtn);
+
+    // 悬浮球（齿轮）
+    const floatBall = document.createElement("div");
     floatBall.id = "sycm-float-ball";
     floatBall.style.cssText = `
-            position:fixed;
-            bottom:30px;
-            right:30px;
             width:40px;
             height:40px;
             border-radius:50%;
@@ -1386,23 +1726,20 @@
             text-align:center;
             line-height:40px;
             cursor:pointer;
-            z-index:99999998;
             box-shadow:0 2px 10px rgba(0,0,0,0.3);
             font-size:18px;
             transition:all 0.2s;
         `;
 
-    // 风控状态下悬浮球样式调整
     if (isRateLimited) {
       floatBall.style.background = "#FF5722";
-      floatBall.title = "请求太频繁被限制！关闭脚本过三四分钟再打开";
+      floatBall.title = "请求被限制，可稍后重试或修改配置后点击重新请求";
       floatBall.textContent = "⚠️";
     } else {
       floatBall.title = "点击打开/关闭SYCM请求调试框";
       floatBall.textContent = "⚙️";
     }
 
-    // 悬浮效果
     floatBall.addEventListener("mouseenter", () => {
       floatBall.style.transform = "scale(1.1)";
       floatBall.style.boxShadow = "0 4px 15px rgba(0,0,0,0.4)";
@@ -1412,7 +1749,6 @@
       floatBall.style.boxShadow = "0 2px 10px rgba(0,0,0,0.3)";
     });
 
-    // 点击打开/关闭调试框
     floatBall.addEventListener("click", () => {
       debugBoxVisible = !debugBoxVisible;
       const debugBox = document.getElementById("product-id-debug-box");
@@ -1425,28 +1761,33 @@
       }
     });
 
-    document.body.appendChild(floatBall);
+    wrapper.appendChild(floatBall);
+    document.body.appendChild(wrapper);
+    updateFloatRetryButton();
   }
 
   /**
-   * 单个商品ID的请求函数
+   * 单个商品ID的请求函数（仅主请求时可不带 actualFee）
    * @param {string} productId 商品ID
+   * @param {{ skipActualFee?: boolean }} options skipActualFee=true 时只请求主接口，不请求 actualFee（用于主请求失败仅重试主请求）
    * @returns {Promise} 请求结果Promise
    */
-  function singleProductRequest(productId) {
-    // 风控状态下直接返回失败
+  function singleProductRequest(productId, options = {}) {
+    const skipActualFee = options.skipActualFee === true;
+
     if (isRateLimited) {
+      const noBurstMsg = "请求太频繁被限制";
       return Promise.resolve({
         success: false,
         productId: productId,
         msg: "请求太频繁被限制，关闭脚本过三四分钟再打开",
-        payAmt: { success: false, value: "", msg: "请求太频繁被限制" },
-        itmUv: { success: false, value: "", msg: "请求太频繁被限制" },
-        itemCartCnt: { success: false, value: "", msg: "请求太频繁被限制" },
-        actualFee: { success: false, value: "", msg: "请求太频繁被限制" }, // 新增字段
+        payAmt: { success: false, value: "", msg: noBurstMsg },
+        itmUv: { success: false, value: "", msg: noBurstMsg },
+        itemCartCnt: { success: false, value: "", msg: noBurstMsg },
+        actualFee: skipActualFee ? undefined : { success: false, value: "", msg: noBurstMsg },
         responseText:
           '{"rgv587_flag":"sm","url":"https://bixi.alicdn.com/punish/..."}',
-        debug: { error: "请求太频繁被限制" },
+        debug: { error: noBurstMsg },
       });
     }
 
@@ -1560,52 +1901,51 @@
           onload: async (response) => {
             // 新增async
             try {
-              // 检测风控数据
-              if (isRateLimitData(response.responseText)) {
+              // 检测风控数据（商品指标接口；仅标记 sycm，仍继续请求 actualFee）
+              if (isRateLimitData(response.responseText, "sycm")) {
                 showTip(
-                  "⚠️ 请求太频繁被限制！关闭脚本过三四分钟再打开",
+                  "⚠️ 商品指标请求被限制",
                   "error",
                 );
-                resolve({
-                  success: false,
-                  productId: productId,
-                  msg: "请求太频繁被限制，关闭脚本过三四分钟再打开",
-                  payAmt: {
+                const burstMsg = response.responseText.includes("被挤爆啦") ? "被挤爆啦" : "请求太频繁被限制";
+                if (!skipActualFee) {
+                  const actualFeeResult = await singleActualFeeRequest(productId);
+                  resolve({
                     success: false,
-                    value: "",
-                    msg: "请求太频繁被限制",
-                  },
-                  itmUv: { success: false, value: "", msg: "请求太频繁被限制" },
-                  itemCartCnt: {
+                    productId: productId,
+                    msg: "请求太频繁被限制，关闭脚本过三四分钟再打开",
+                    payAmt: { success: false, value: "", msg: burstMsg },
+                    itmUv: { success: false, value: "", msg: burstMsg },
+                    itemCartCnt: { success: false, value: "", msg: burstMsg },
+                    actualFee: actualFeeResult,
+                    responseText: response.responseText,
+                    debug: { error: burstMsg, rawText: response.responseText },
+                  });
+                } else {
+                  resolve({
                     success: false,
-                    value: "",
-                    msg: "请求太频繁被限制",
-                  },
-                  actualFee: {
-                    success: false,
-                    value: "",
-                    msg: "请求太频繁被限制",
-                  }, // 新增字段
-                  responseText: response.responseText,
-                  debug: {
-                    error: "请求太频繁被限制",
-                    rawText: response.responseText,
-                  },
-                });
-                batchRequestRunning = true; // 终止后续请求
-                renderMetrics(); // 重新渲染指标
+                    productId: productId,
+                    msg: "请求太频繁被限制，关闭脚本过三四分钟再打开",
+                    payAmt: { success: false, value: "", msg: burstMsg },
+                    itmUv: { success: false, value: "", msg: burstMsg },
+                    itemCartCnt: { success: false, value: "", msg: burstMsg },
+                    actualFee: undefined,
+                    responseText: response.responseText,
+                    debug: { error: burstMsg, rawText: response.responseText },
+                  });
+                }
+                renderMetrics();
                 return;
               }
 
-              // 提取指标数据
               const metrics = extractMetrics(response.responseText);
-              // 新增：调用actualFee请求
-              const actualFeeResult = await singleActualFeeRequest(productId);
+              let actualFeeResult = null;
+              if (!skipActualFee) {
+                actualFeeResult = await singleActualFeeRequest(productId);
+              }
 
               let parsedData = {};
               let formattedResponseText = response.responseText;
-
-              // 格式化JSON响应
               try {
                 parsedData = JSON.parse(response.responseText);
                 formattedResponseText = JSON.stringify(parsedData, null, 2);
@@ -1613,15 +1953,16 @@
                 showTip(`ID ${productId}：JSON解析失败`, "error");
               }
 
-              // 返回请求结果（新增actualFee字段）
               resolve({
                 success: true,
                 productId: productId,
-                msg: `请求成功，状态码：${response.status} | ${metrics.payAmt.msg} | ${metrics.itmUv.msg} | ${metrics.itemCartCnt.msg} | ${actualFeeResult.msg}`,
+                msg: skipActualFee
+                  ? `请求成功，状态码：${response.status} | ${metrics.payAmt.msg} | ${metrics.itmUv.msg} | ${metrics.itemCartCnt.msg}`
+                  : `请求成功，状态码：${response.status} | ${metrics.payAmt.msg} | ${metrics.itmUv.msg} | ${metrics.itemCartCnt.msg} | ${actualFeeResult.msg}`,
                 payAmt: metrics.payAmt,
                 itmUv: metrics.itmUv,
                 itemCartCnt: metrics.itemCartCnt,
-                actualFee: actualFeeResult, // 新增字段
+                actualFee: skipActualFee ? undefined : actualFeeResult,
                 responseText: formattedResponseText,
                 debug: {
                   url: requestUrl,
@@ -1631,8 +1972,8 @@
                   status: response.status,
                   rawText: response.responseText,
                   parsedData: JSON.stringify(parsedData, null, 2),
-                  actualFeeResponse: actualFeeResult.responseText, // 新增调试信息
-                  actualFeeRaw: actualFeeResult.rawText,
+                  actualFeeResponse: skipActualFee ? undefined : actualFeeResult.responseText,
+                  actualFeeRaw: skipActualFee ? undefined : actualFeeResult.rawText,
                 },
               });
             } catch (error) {
@@ -1640,26 +1981,10 @@
                 success: false,
                 productId: productId,
                 msg: `请求成功但处理失败：${error.message}`,
-                payAmt: {
-                  success: false,
-                  value: "",
-                  msg: `处理失败：${error.message}`,
-                },
-                itmUv: {
-                  success: false,
-                  value: "",
-                  msg: `处理失败：${error.message}`,
-                },
-                itemCartCnt: {
-                  success: false,
-                  value: "",
-                  msg: `处理失败：${error.message}`,
-                },
-                actualFee: {
-                  success: false,
-                  value: "",
-                  msg: `处理失败：${error.message}`,
-                }, // 新增字段
+                payAmt: { success: false, value: "", msg: `处理失败：${error.message}` },
+                itmUv: { success: false, value: "", msg: `处理失败：${error.message}` },
+                itemCartCnt: { success: false, value: "", msg: `处理失败：${error.message}` },
+                actualFee: skipActualFee ? undefined : { success: false, value: "", msg: `处理失败：${error.message}` },
                 responseText: error.message,
                 debug: { error: error.message },
               });
@@ -1670,26 +1995,10 @@
               success: false,
               productId: productId,
               msg: `请求失败：${error.message || "网络错误"}`,
-              payAmt: {
-                success: false,
-                value: "",
-                msg: "请求失败，无法提取支付金额",
-              },
-              itmUv: {
-                success: false,
-                value: "",
-                msg: "请求失败，无法提取访客数",
-              },
-              itemCartCnt: {
-                success: false,
-                value: "",
-                msg: "请求失败，无法提取加购件数",
-              },
-              actualFee: {
-                success: false,
-                value: "",
-                msg: "请求失败，无法提取actualFee",
-              }, // 新增字段
+              payAmt: { success: false, value: "", msg: "请求失败，无法提取支付金额" },
+              itmUv: { success: false, value: "", msg: "请求失败，无法提取访客数" },
+              itemCartCnt: { success: false, value: "", msg: "请求失败，无法提取加购件数" },
+              actualFee: skipActualFee ? undefined : { success: false, value: "", msg: "请求失败，无法提取actualFee" },
               responseText: error.message || "网络错误",
               debug: { error: error.message || "网络错误" },
             });
@@ -1699,26 +2008,10 @@
               success: false,
               productId: productId,
               msg: "请求超时（10秒）",
-              payAmt: {
-                success: false,
-                value: "",
-                msg: "请求超时，无法提取支付金额",
-              },
-              itmUv: {
-                success: false,
-                value: "",
-                msg: "请求超时，无法提取访客数",
-              },
-              itemCartCnt: {
-                success: false,
-                value: "",
-                msg: "请求超时，无法提取加购件数",
-              },
-              actualFee: {
-                success: false,
-                value: "",
-                msg: "请求超时，无法提取actualFee",
-              }, // 新增字段
+              payAmt: { success: false, value: "", msg: "请求超时，无法提取支付金额" },
+              itmUv: { success: false, value: "", msg: "请求超时，无法提取访客数" },
+              itemCartCnt: { success: false, value: "", msg: "请求超时，无法提取加购件数" },
+              actualFee: skipActualFee ? undefined : { success: false, value: "", msg: "请求超时，无法提取actualFee" },
               responseText: "请求超时（10秒）",
               debug: { error: "请求超时（10秒）" },
             });
@@ -1729,22 +2022,10 @@
           success: false,
           productId: productId,
           msg: `请求异常：${error.message}`,
-          payAmt: {
-            success: false,
-            value: "",
-            msg: "请求异常，无法提取支付金额",
-          },
+          payAmt: { success: false, value: "", msg: "请求异常，无法提取支付金额" },
           itmUv: { success: false, value: "", msg: "请求异常，无法提取访客数" },
-          itemCartCnt: {
-            success: false,
-            value: "",
-            msg: "请求异常，无法提取加购件数",
-          },
-          actualFee: {
-            success: false,
-            value: "",
-            msg: "请求异常，无法提取actualFee",
-          }, // 新增字段
+          itemCartCnt: { success: false, value: "", msg: "请求异常，无法提取加购件数" },
+          actualFee: skipActualFee ? undefined : { success: false, value: "", msg: "请求异常，无法提取actualFee" },
           responseText: error.message,
           debug: { error: error.message },
         });
@@ -1756,10 +2037,38 @@
    * 批量请求商品数据（支持并发配置）
    * @param {array} productIds 商品ID列表
    */
+  /**
+   * 合并请求结果：新结果中被限制/失败字段不覆盖旧结果中的成功数据
+   * @param {object} existing 已有结果（可能含部分成功）
+   * @param {object} newResult 本次请求结果
+   * @returns {object} 合并后的结果
+   */
+  function mergeRequestResult(existing, newResult) {
+    if (!existing || !newResult || existing.productId !== newResult.productId) {
+      return newResult;
+    }
+    const keepOldIfNewFailed = (oldField, newField) => {
+      if (newField && newField.success) return newField;
+      if (oldField && oldField.success) return oldField;
+      return newField || oldField;
+    };
+    return {
+      ...newResult,
+      success: newResult.success || existing.success,
+      payAmt: keepOldIfNewFailed(existing.payAmt, newResult.payAmt),
+      itmUv: keepOldIfNewFailed(existing.itmUv, newResult.itmUv),
+      itemCartCnt: keepOldIfNewFailed(existing.itemCartCnt, newResult.itemCartCnt),
+      actualFee: keepOldIfNewFailed(existing.actualFee, newResult.actualFee),
+      msg: newResult.msg || existing.msg,
+      responseText: newResult.responseText || existing.responseText,
+      debug: newResult.debug || existing.debug,
+    };
+  }
+
   async function batchRequestProductData(productIds) {
-    // 风控状态下直接返回
-    if (isRateLimited) {
-      showTip("⚠️ 请求太频繁被限制！关闭脚本过三四分钟再打开", "error");
+    // 仅当两个接口都被限制时才不再发起请求
+    if (isRateLimitedSycm && isRateLimitedTrade) {
+      showTip("⚠️ 请求被限制，可稍后重试或修改配置后点击重新请求", "error");
       return;
     }
 
@@ -1793,8 +2102,8 @@
 
     // 遍历每个批次
     for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
-      // 风控状态下终止请求
-      if (isRateLimited) break;
+      // 仅当两个接口都被限制时才终止批次，否则另一个接口继续请求
+      if (isRateLimitedSycm && isRateLimitedTrade) break;
 
       const batch = batches[batchIndex];
       // 非第一个批次，等待指定间隔
@@ -1804,7 +2113,18 @@
       const batchPromises = batch.map(async (productId) => {
         try {
           const requestResult = await singleProductRequest(productId);
-          requestResults.push(requestResult);
+          // 合并结果：被限制时保留之前请求成功的数据，不覆盖
+          const existingIndex = requestResults.findIndex(
+            (r) => r && r.productId === productId
+          );
+          if (existingIndex >= 0) {
+            requestResults[existingIndex] = mergeRequestResult(
+              requestResults[existingIndex],
+              requestResult
+            );
+          } else {
+            requestResults.push(requestResult);
+          }
           // 记录已请求的ID
           if (!requestedProductIds.includes(productId)) {
             requestedProductIds.push(productId);
@@ -1838,8 +2158,8 @@
 
     // 批量请求完成
     batchRequestRunning = false;
-    // 非风控状态显示完成提示
-    if (!isRateLimited) {
+    // 非全风控状态显示完成提示
+    if (!(isRateLimitedSycm && isRateLimitedTrade)) {
       showTip(
         `✅ 请求完成！总${concurrentStatus.total}个 | 成功${concurrentStatus.success}个 | 失败${concurrentStatus.failed}个`,
         "success",
@@ -1855,9 +2175,9 @@
    * @param {array} targetIds 指定的商品ID列表（可选）
    */
   function autoRequestNewProducts(targetIds = []) {
-    // 风控状态下直接返回
-    if (isRateLimited) {
-      showTip("⚠️ 请求太频繁被限制！关闭脚本过三四分钟再打开", "error");
+    // 仅当两个接口都被限制时才不再请求
+    if (isRateLimitedSycm && isRateLimitedTrade) {
+      showTip("⚠️ 请求被限制，可稍后重试或修改配置后点击重新请求", "error");
       return;
     }
 
@@ -1897,10 +2217,7 @@
       // 防抖处理：1秒内只处理一次
       clearTimeout(window.observerDebounce);
       window.observerDebounce = setTimeout(() => {
-        // 风控状态下不处理
-        if (isRateLimited) return;
-
-        // 获取当前ID列表
+        // 获取当前ID列表（风控时仍更新界面，自动请求由 autoRequestNewProducts 在双限时拦截）
         const currentIds = extractProductIds().ids;
         // ID列表变化时处理
         if (JSON.stringify(currentIds) !== JSON.stringify(lastProductIds)) {
@@ -1979,18 +2296,17 @@
                 vertical-align:middle;
             `;
 
-      // 构建状态提示
+      // 构建状态提示（被限制时仅提示，不禁用脚本）
       let statusHtml = "";
       if (isRateLimited) {
-        statusHtml = `<div style="color:#FF5722;font-size:11px;margin-bottom:8px;font-weight:bold;">⚠️ 请求太频繁被限制！关闭脚本过三四分钟再打开</div>`;
-      } else {
-        statusHtml = batchRequestRunning
-          ? `<div style="color:#4CAF50;font-size:11px;margin-bottom:8px;">🚦 请求中 | 并发数：${globalMaxConcurrent} | 间隔：${globalRequestInterval}ms | 进度：${concurrentStatus.completed}/${concurrentStatus.total} | 成功：${concurrentStatus.success} | 失败：${concurrentStatus.failed}</div>`
-          : `<div style="color:${newIdCount > 0 ? "#FF9800" : "#4CAF50"};font-size:11px;margin-bottom:8px;">🚦 无运行批次 | 待请求新增ID：${newIdCount} | 并发数：${globalMaxConcurrent} | 间隔：${globalRequestInterval}ms</div>`;
+        statusHtml = `<div style="color:#FF5722;font-size:11px;margin-bottom:8px;font-weight:bold;">⚠️ 请求太频繁被限制，请稍后再试。可修改下方配置后点击「重新请求」</div>`;
       }
+      statusHtml += batchRequestRunning
+        ? `<div style="color:#4CAF50;font-size:11px;margin-bottom:8px;">🚦 请求中 | 并发数：${globalMaxConcurrent} | 间隔：${globalRequestInterval}ms | 进度：${concurrentStatus.completed}/${concurrentStatus.total} | 成功：${concurrentStatus.success} | 失败：${concurrentStatus.failed}</div>`
+        : `<div style="color:${newIdCount > 0 ? "#FF9800" : "#4CAF50"};font-size:11px;margin-bottom:8px;">🚦 无运行批次 | 待请求新增ID：${newIdCount} | 并发数：${globalMaxConcurrent} | 间隔：${globalRequestInterval}ms</div>`;
 
-      // 风控状态下禁用输入框
-      const inputDisabled = isRateLimited ? "disabled" : "";
+      // 被限制时也不禁用输入框，用户可改配置后重试
+      const inputDisabled = "";
 
       // 构建配置输入框
       const configHtml = `
@@ -2010,12 +2326,25 @@
                         <span style="color:#999;font-size:10px;">(最小100)</span>
                     </div>
                 </div>
+                <div style="margin:3px 0;padding:4px 6px;background:#332200;border-radius:3px;color:#FFB74D;font-size:11px;line-height:1.4;">
+                    如果修改请求速度，有概率会触发平台风控，若触发风控请关闭此脚本过几分钟再打开
+                </div>
             `;
+
+      // 获取需要重试的失败 ID（主请求或 actualFee 失败）
+      const failedIds = getAllFailedRetryIds();
+      const hasFailedRequests = failedIds.length > 0;
+
+      // 构建重新请求按钮
+      const retryButtonHtml = hasFailedRequests
+        ? `<button id="retry-request-btn" style="background:#FF9800;border:none;color:white;padding:5px 10px;border-radius:3px;cursor:pointer;margin:5px 0;">🔄 重新请求（${failedIds.length}个失败）</button>`
+        : "";
 
       // 构建Cookie面板
       const cookiePanel = `
                 <div style="margin:8px 0;">
                     ${statusHtml}
+                    ${retryButtonHtml}
                     <div style="font-weight:bold;margin-bottom:5px;color;">🍪 配置参数：</div>
                     ${configHtml}
                     <div style="margin:3px 0;padding:2px 5px;background:#222;border-radius:3px;">
@@ -2032,12 +2361,9 @@
       // ID列表折叠按钮
       const idFoldButton = `<button id="fold-ids-btn" style="${foldButtonStyle}">${foldState.ids ? "展开" : "收起"}</button>`;
 
-      // 构建ID列表（新增actualFee展示）
+      // 构建ID列表（新增actualFee展示；被限制时仍显示列表，不替换为提示）
       let idListHtml = "";
-      if (isRateLimited) {
-        idListHtml = `<div style="color:#FF5722;margin:5px 0;font-weight:bold;">⚠️ 请求太频繁被限制，关闭脚本过三四分钟再打开</div>`;
-      } else {
-        idListHtml =
+      idListHtml =
           productIdData.ids.length > 0
             ? productIdData.ids
                 .map((productId) => {
@@ -2048,11 +2374,10 @@
                   const isRequested = requestedProductIds.includes(productId);
                   // 判断是否有有效数据（包含actualFee）
                   const hasValidData =
-                    (payAmt !== "待请求" && payAmt !== "暂无数据") ||
-                    (visitorCount !== "待请求" &&
-                      visitorCount !== "暂无数据") ||
-                    (cartCount !== "待请求" && cartCount !== "暂无数据") ||
-                    (actualFee !== "待请求" && actualFee !== "暂无数据");
+                    (payAmt !== "待请求" && payAmt !== "暂无数据" && payAmt !== "请求失败") ||
+                    (visitorCount !== "待请求" && visitorCount !== "暂无数据" && visitorCount !== "请求失败") ||
+                    (cartCount !== "待请求" && cartCount !== "暂无数据" && cartCount !== "请求失败") ||
+                    (actualFee !== "待请求" && actualFee !== "暂无数据" && actualFee !== "请求失败");
                   const textColor = hasValidData ? "#4CAF50" : "#FF5722";
 
                   return `
@@ -2073,7 +2398,6 @@
                 })
                 .join("")
             : `<div style="color:#FF9800;margin:5px 0;">${productIdData.msg}</div>`;
-      }
 
       // 构建ID面板
       const idPanel = `
@@ -2083,59 +2407,43 @@
                 </div>
             `;
 
-      // 结果列表折叠按钮
-      const resultFoldButton = `<button id="fold-results-btn" style="${foldButtonStyle}">${foldState.results ? "展开" : "收起"}</button>`;
-
-      // 构建请求结果列表（新增actualFee相关展示，修复宽度溢出）
-      let resultListHtml = "";
-      if (isRateLimited) {
-        resultListHtml = `<div style="color:#FF5722;margin:5px 0;font-weight:bold;">⚠️ 请求太频繁被限制，关闭脚本过三四分钟再打开</div>`;
-      } else {
-        resultListHtml =
-          requestResults.length > 0
-            ? `<div style="color:#4CAF50;font-size:11px;margin-bottom:5px;">📝 详细请求结果（共${requestResults.length}条）：</div>` +
-              requestResults
-                .map((result, index) => {
-                  const textColor = result.success ? "#4CAF50" : "#FF5722";
-                  const icon = result.success ? "✅" : "❌";
-                  // 指标提取结果（新增actualFee）
-                  const metricsHtml = `
+      // 单条结果卡片 HTML（供成功/失败列表共用，index 为在 requestResults 中的下标，用于复制）
+      const buildResultCard = (result, index) => {
+        const textColor = result.success ? "#4CAF50" : "#FF5722";
+        const icon = result.success ? "✅" : "❌";
+        const metricsHtml = `
                                 <div style="margin:5px 0;padding:5px;background:#1a1a1a;border-radius:3px;">
                                     <div style="color:#FFC107;font-size:11px;margin-bottom:3px;"><strong>🎯 数据提取结果：</strong></div>
-                                    <div style="font-size:11px;color:${result.payAmt.success ? "#4CAF50" : "#FF5722"};">支付金额：${result.payAmt.msg}</div>
-                                    <div style="font-size:11px;color:${result.itmUv.success ? "#4CAF50" : "#FF5722"};">访客数：${result.itmUv.msg}</div>
-                                    <div style="font-size:11px;color:${result.itemCartCnt.success ? "#4CAF50" : "#FF5722"};">加购件数：${result.itemCartCnt.msg}</div>
-                                    <div style="font-size:11px;color:${result.actualFee.success ? "#4CAF50" : "#FF5722"};">实收款：${result.actualFee.msg}</div> <!-- 新增actualFee -->
-                                    ${result.payAmt.value ? `<div style="font-size:12px;color:#fff;margin-top:2px;">支付金额值：<strong>${formatNumber(result.payAmt.value)}</strong></div>` : ""}
-                                    ${result.itmUv.value ? `<div style="font-size:12px;color:#fff;margin-top:2px;">访客数值：<strong>${result.itmUv.value}</strong></div>` : ""}
-                                    ${result.itemCartCnt.value ? `<div style="font-size:12px;color:#fff;margin-top:2px;">加购件数值：<strong>${result.itemCartCnt.value}</strong></div>` : ""}
-                                </div>
-                            `;
-                  // 复制按钮
-                  const copyButton = `<button class="copy-response-btn" data-idx="${index}" style="background:#2196F3;border:none;color:white;padding:2px 8px;border-radius:3px;cursor:pointer;font-size:11px;margin-left:10px;">复制响应数据</button>`;
-
-                  return `
+                                    <div style="font-size:11px;color:${result.payAmt && result.payAmt.success ? "#4CAF50" : "#FF5722"};">支付金额：${result.payAmt ? result.payAmt.msg : "-"}</div>
+                                    <div style="font-size:11px;color:${result.itmUv && result.itmUv.success ? "#4CAF50" : "#FF5722"};">访客数：${result.itmUv ? result.itmUv.msg : "-"}</div>
+                                    <div style="font-size:11px;color:${result.itemCartCnt && result.itemCartCnt.success ? "#4CAF50" : "#FF5722"};">加购件数：${result.itemCartCnt ? result.itemCartCnt.msg : "-"}</div>
+                                    <div style="font-size:11px;color:${result.actualFee && result.actualFee.success ? "#4CAF50" : "#FF5722"};">实收款：${result.actualFee ? result.actualFee.msg : "-"}</div>
+                                    ${result.payAmt && result.payAmt.value ? `<div style="font-size:12px;color:#fff;margin-top:2px;">支付金额值：<strong>${formatNumber(result.payAmt.value)}</strong></div>` : ""}
+                                    ${result.itmUv && result.itmUv.value ? `<div style="font-size:12px;color:#fff;margin-top:2px;">访客数值：<strong>${result.itmUv.value}</strong></div>` : ""}
+                                    ${result.itemCartCnt && result.itemCartCnt.value ? `<div style="font-size:12px;color:#fff;margin-top:2px;">加购件数值：<strong>${result.itemCartCnt.value}</strong></div>` : ""}
+                                </div>`;
+        const copyButton = `<button class="copy-response-btn" data-idx="${index}" style="background:#2196F3;border:none;color:white;padding:2px 8px;border-radius:3px;cursor:pointer;font-size:11px;margin-left:10px;">复制响应数据</button>`;
+        return `
                                 <div style="margin:8px 0;padding:8px;background:#222;border-radius:3px;border-left:3px solid ${textColor};">
                                     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:5px;flex-wrap:wrap;">
-                                        <span style="font-weight:bold;color:${textColor};">${icon} 结果 #${index + 1} - ID：${result.productId}</span>
+                                        <span style="font-weight:bold;color:${textColor};">${icon} ID：${result.productId}</span>
                                         <div style="margin-top:3px;">
                                             <span style="font-size:10px;color:#999;">${new Date().toLocaleTimeString()}</span>
                                             ${copyButton}
                                         </div>
                                     </div>
                                     <div style="font-size:11px;color:#ccc;margin-bottom:5px;word-wrap:break-word;">${result.msg}</div>
-                                    ${result.debug.url ? `<div style="font-size:10px;color:#aaa;margin:3px 0;word-wrap:break-word;">• URL：<code style="word-wrap:break-word;">${result.debug.url.substring(0, 80)}...</code></div>` : ""}
-                                    ${result.debug.timestamp ? `<div style="font-size:10px;color:#aaa;margin:3px 0;">• 时间戳：${result.debug.timestamp}</div>` : ""}
-                                    ${result.debug.dateRange ? `<div style="font-size:10px;color:#aaa;margin:3px 0;">• dateRange：${result.debug.dateRange}</div>` : ""}
+                                    ${result.debug && result.debug.url ? `<div style="font-size:10px;color:#aaa;margin:3px 0;word-wrap:break-word;">• URL：<code style="word-wrap:break-word;">${result.debug.url.substring(0, 80)}...</code></div>` : ""}
+                                    ${result.debug && result.debug.timestamp ? `<div style="font-size:10px;color:#aaa;margin:3px 0;">• 时间戳：${result.debug.timestamp}</div>` : ""}
+                                    ${result.debug && result.debug.dateRange ? `<div style="font-size:10px;color:#aaa;margin:3px 0;">• dateRange：${result.debug.dateRange}</div>` : ""}
                                     ${metricsHtml}
-                                    <!-- 新增主订单actualFee详细信息 -->
-                                    ${result.actualFee.value && result.actualFee.value.length > 0 ? `
+                                    ${result.actualFee && result.actualFee.value && result.actualFee.value.length > 0 ? `
                                     <div style="margin:5px 0;padding:5px;background:#1a1a1a;border-radius:3px;">
                                         <div style="color:#FF9800;font-size:11px;margin-bottom:3px;"><strong>💰 主订单actualFee详细：</strong></div>
                                         <div style="font-size:10px;color:#fff;line-height:1.4;">
-                                            ${result.actualFee.value.map((order, index) => `
+                                            ${result.actualFee.value.map((order, i) => `
                                                 <div style="margin-bottom:3px;padding:2px 4px;background:#222;border-radius:2px;">
-                                                    <div><strong>订单${index + 1}：</strong>${order.orderId}</div>
+                                                    <div><strong>订单${i + 1}：</strong>${order.orderId}</div>
                                                     <div><strong>实收款：</strong>¥${order.realTotal}</div>
                                                     <div><strong>订单时间：</strong>${order.orderTime}</div>
                                                     <div><strong>订单状态：</strong>${order.orderStatus}</div>
@@ -2146,39 +2454,43 @@
                                     ` : ""}
                                     <div style="margin:5px 0;padding:5px;background:#1a1a1a;border-radius:3px;">
                                         <div style="color:#8BC34A;font-size:11px;margin-bottom:3px;">基础响应数据：</div>
-                                        <!-- 修复pre标签宽度溢出问题 -->
-                                        <pre style="margin:0;padding:3px;background:#000;border-radius:2px;color:#8BC34A;font-size:10px;max-height:100px;overflow:auto;white-space:pre-wrap;word-wrap:break-word;">${result.debug.parsedData || result.debug.rawText || result.debug.error || "无"}</pre>
+                                        <pre style="margin:0;padding:3px;background:#000;border-radius:2px;color:#8BC34A;font-size:10px;max-height:100px;overflow:auto;white-space:pre-wrap;word-wrap:break-word;">${result.responseText || (result.debug && (result.debug.parsedData || result.debug.rawText || result.debug.error)) || "无"}</pre>
                                     </div>
-                                    ${
-                                      result.debug.actualFeeResponse
-                                        ? `
+                                    ${result.debug && result.debug.actualFeeResponse ? `
                                     <div style="margin:5px 0;padding:5px;background:#1a1a1a;border-radius:3px;">
                                         <div style="color:#FF9800;font-size:11px;margin-bottom:3px;">actualFee请求响应：</div>
-                                        <!-- 修复pre标签宽度溢出问题 -->
                                         <pre style="margin:0;padding:3px;background:#000;border-radius:2px;color:#FF9800;font-size:10px;max-height:100px;overflow:auto;white-space:pre-wrap;word-wrap:break-word;">${result.debug.actualFeeResponse || "无"}</pre>
                                     </div>
-                                    `
-                                        : ""
-                                    }
-                                </div>
-                            `;
-                })
-                .join("")
-            : `<div style="color:#ccc;font-size:11px;margin:5px 0;">📌 填写cookie2后，自动请求ID，结果将展示在此处</div>`;
-      }
+                                    ` : ""}
+                                </div>`;
+      };
 
-      // 构建结果面板
+      const successList = requestResults.map((r, i) => ({ result: r, index: i })).filter((x) => x.result.success);
+      const failedList = requestResults.map((r, i) => ({ result: r, index: i })).filter((x) => !x.result.success);
+      const successFoldBtn = `<button id="fold-results-success-btn" style="${foldButtonStyle}">${foldState.resultsSuccess ? "展开" : "收起"}</button>`;
+      const failedFoldBtn = `<button id="fold-results-failed-btn" style="${foldButtonStyle}">${foldState.resultsFailed ? "展开" : "收起"}</button>`;
+      const successListHtml = successList.length > 0
+        ? successList.map((x) => buildResultCard(x.result, x.index)).join("")
+        : `<div style="color:#999;font-size:11px;margin:5px 0;">暂无成功结果</div>`;
+      const failedListHtml = failedList.length > 0
+        ? failedList.map((x) => buildResultCard(x.result, x.index)).join("")
+        : `<div style="color:#999;font-size:11px;margin:5px 0;">暂无失败结果</div>`;
+
       const resultPanel = `
                 <div style="margin:8px 0;">
-                    <div style="font-weight:bold;margin-bottom:5px;color:#fff;">📡 请求结果 ${resultFoldButton}</div>
-                    <div id="results-content" style="display:${foldState.results ? "none" : "block"};">${resultListHtml}</div>
+                    <div style="font-weight:bold;margin-bottom:5px;color:#fff;">📡 请求成功结果（${successList.length}条）${successFoldBtn}</div>
+                    <div id="results-success-content" style="display:${foldState.resultsSuccess ? "none" : "block"};">${successListHtml}</div>
+                </div>
+                <div style="margin:8px 0;">
+                    <div style="font-weight:bold;margin-bottom:5px;color:#fff;">📡 请求失败结果（${failedList.length}条）${failedFoldBtn}</div>
+                    <div id="results-failed-content" style="display:${foldState.resultsFailed ? "none" : "block"};">${failedListHtml}</div>
                 </div>
             `;
 
       // 构建调试框完整HTML（添加宽度限制和横向滚动）
       const debugBoxHtml = `
                 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;border-bottom:1px solid #444;padding-bottom:5px;flex-wrap:wrap;">
-                    <span style="font-weight:bold;color:#4CAF50;">近30天商品访客数/加购件数/支付金额+近3个月订单自动获取 --zzy</span>
+                    <span style="font-weight:bold;color:#4CAF50;">近30天商品访客数/加购件数/支付金额+近3个月订单自动获取 --Ace</span>
                     <span style="font-size:11px;color:#999;">${new Date().toLocaleTimeString()}</span>
                 </div>
                 ${cookiePanel}
@@ -2223,7 +2535,6 @@
           cookieInputFocused = false;
         });
         cookieInput.addEventListener("input", () => {
-          if (isRateLimited) return;
           globalCookie2 = cookieInput.value.trim();
           batchRequestRunning = false;
           // 自动请求新ID
@@ -2243,7 +2554,6 @@
       if (!concurrentInput.dataset.bound) {
         concurrentInput.dataset.bound = "true";
         concurrentInput.addEventListener("change", () => {
-          if (isRateLimited) return;
           globalMaxConcurrent = concurrentInput.value.trim();
           validateRequestParams(); // 校验并修正
           concurrentInput.value = globalMaxConcurrent; // 同步修正后的值
@@ -2256,7 +2566,6 @@
       if (!intervalInput.dataset.bound) {
         intervalInput.dataset.bound = "true";
         intervalInput.addEventListener("change", () => {
-          if (isRateLimited) return;
           globalRequestInterval = intervalInput.value.trim();
           validateRequestParams(); // 校验并修正
           intervalInput.value = globalRequestInterval; // 同步修正后的值
@@ -2274,12 +2583,21 @@
         };
       }
 
-      // 绑定结果列表折叠按钮事件
-      const resultFoldButtonEl = debugBox.querySelector("#fold-results-btn");
-      if (!resultFoldButtonEl.dataset.bound) {
-        resultFoldButtonEl.dataset.bound = "true";
-        resultFoldButtonEl.onclick = () => {
-          foldState.results = !foldState.results;
+      // 绑定「请求成功结果」折叠按钮
+      const resultSuccessFoldEl = debugBox.querySelector("#fold-results-success-btn");
+      if (resultSuccessFoldEl && !resultSuccessFoldEl.dataset.bound) {
+        resultSuccessFoldEl.dataset.bound = "true";
+        resultSuccessFoldEl.onclick = () => {
+          foldState.resultsSuccess = !foldState.resultsSuccess;
+          renderDebugBox();
+        };
+      }
+      // 绑定「请求失败结果」折叠按钮
+      const resultFailedFoldEl = debugBox.querySelector("#fold-results-failed-btn");
+      if (resultFailedFoldEl && !resultFailedFoldEl.dataset.bound) {
+        resultFailedFoldEl.dataset.bound = "true";
+        resultFailedFoldEl.onclick = () => {
+          foldState.resultsFailed = !foldState.resultsFailed;
           renderDebugBox();
         };
       }
@@ -2297,6 +2615,17 @@
           };
         }
       });
+
+      // 绑定重新请求按钮事件（与悬浮区重试共用逻辑）
+      const retryButton = debugBox.querySelector("#retry-request-btn");
+      if (retryButton && !retryButton.dataset.bound) {
+        retryButton.dataset.bound = "true";
+        retryButton.onclick = () => {
+          doRetryFailedRequests();
+          updateFloatRetryButton();
+          renderDebugBox();
+        };
+      }
 
       // 绑定滚动事件（记录滚动位置）
       if (!debugBox.dataset.scrollBound) {
